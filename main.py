@@ -299,22 +299,30 @@ async def handle_url(client, message: Message):
 
             async def process_track(track_url):
                 nonlocal total_size, limit_reached
+                track_name = track_url
                 retries = 3
+
                 for attempt in range(retries):
                     if limit_reached:
-                        return "LIMIT_REACHED"
+                        return ("LIMIT_REACHED", None)
                     
                     try:
                         async with semaphore:
                             if limit_reached:
-                                return "LIMIT_REACHED"
+                                return ("LIMIT_REACHED", None)
 
+                            # Coba ambil judul awal dari url agar kalau gagal kita tau nama lagunya
                             meta = await downloader.fetch_spotify_metadata(session, track_url)
+                            if meta and meta.get("title"):
+                                track_name = f"{meta.get('artist', 'Unknown')} - {meta['title']}"
+
                             t_id, d_id = await downloader.resolve_with_songlink(session, track_url)
-                            if not t_id: return None
+                            if not t_id: return ("ERROR", track_name)
                             
                             if not meta:
                                 meta = await downloader.fetch_metadata(session, d_id)
+                                if meta and meta.get("title"):
+                                    track_name = f"{meta.get('artist', 'Unknown')} - {meta['title']}"
                             elif d_id:
                                 d_meta = await downloader.fetch_metadata(session, d_id)
                                 if d_meta:
@@ -323,10 +331,10 @@ async def handle_url(client, message: Message):
                                     meta = d_meta
 
                             api_data = await downloader.fetch_manifest_parallel(session, t_id)
-                            if not api_data: return None
+                            if not api_data: return ("ERROR", track_name)
                             
                             direct_url = downloader.decode_manifest(api_data)
-                            if not direct_url: return None
+                            if not direct_url: return ("ERROR", track_name)
 
                             filepath, _ = await downloader.download_file(session, direct_url, meta, t_id)
                             if filepath and os.path.exists(filepath):
@@ -335,32 +343,34 @@ async def handle_url(client, message: Message):
                                 async with size_lock:
                                     if limit_reached:
                                         os.remove(filepath)
-                                        return "LIMIT_REACHED"
+                                        return ("LIMIT_REACHED", None)
 
                                     if total_size + file_size > MAX_ZIP_SIZE:
                                         limit_reached = True
                                         os.remove(filepath)
                                         logger.info(f"Size limit reached. Removing last track to stay under 2GB.")
-                                        return "LIMIT_REACHED"
+                                        return ("LIMIT_REACHED", None)
 
                                     total_size += file_size
-                                    return filepath
+                                    return ("SUCCESS", filepath)
                     except Exception as e:
                         logger.error(f"Gagal download lagu {track_url} (Percobaan {attempt+1}/{retries}): {e}")
                         if attempt == retries - 1:
-                            return None
+                            return ("ERROR", track_name)
                         await asyncio.sleep(2) # Jeda sebentar sebelum retry
-                return None
+                return ("ERROR", track_name)
 
             tasks = [asyncio.create_task(process_track(url)) for url in track_urls]
             results = await asyncio.gather(*tasks)
 
-            for res in results:
-                if res == "LIMIT_REACHED":
-                    # Kalau udah limit, biarkan yg udah didownload saja
+            failed_tracks = []
+            for status, res in results:
+                if status == "LIMIT_REACHED":
                     pass
-                elif res is not None:
+                elif status == "SUCCESS" and res is not None:
                     downloaded_files.append(res)
+                elif status == "ERROR":
+                    failed_tracks.append(res)
             
             if not downloaded_files:
                 await status_msg.delete()
@@ -378,9 +388,24 @@ async def handle_url(client, message: Message):
                         zipf.write(file, os.path.basename(file))
                 
                 await status_msg.edit_text("⏳ `Mengunggah file ZIP ke Telegram...`")
+
+                caption = f"✅ **{playlist_title}**\n💿 Playlist Download ({len(downloaded_files)} lagu)"
+                if failed_tracks:
+                    failed_list = "\n".join(failed_tracks[:10])
+                    if len(failed_tracks) > 10:
+                        failed_list += f"\n...dan {len(failed_tracks) - 10} lagu lainnya."
+
+                    # Prevent unclosed markdown entities by explicitly measuring string lengths
+                    base_str = f"\n\n⚠️ **Gagal didownload ({len(failed_tracks)}):**\n`"
+                    if len(caption) + len(base_str) + len(failed_list) + 1 > 1024:
+                        allowed_len = 1024 - len(caption) - len(base_str) - 4
+                        failed_list = failed_list[:allowed_len] + "..."
+
+                    caption += base_str + failed_list + "`"
+
                 await message.reply_document(
                     document=zip_filepath,
-                    caption=f"✅ **{playlist_title}**\n💿 Playlist Download ({len(downloaded_files)} lagu)"
+                    caption=caption
                 )
             except Exception as e:
                 logger.error(f"Gagal upload zip: {e}")
@@ -398,11 +423,22 @@ async def handle_url(client, message: Message):
         # 1. Ambil Metadata dari Spotify (jika URL Spotify)
         metadata = await downloader.fetch_spotify_metadata(session, url)
         
+        # Coba format judul lagu untuk error message
+        track_display_name = "lagu ini"
+        if metadata and metadata.get("title"):
+            track_display_name = f"**{metadata.get('artist', 'Unknown')} - {metadata['title']}**"
+
         # 2. Resolve ID (Cari padanan lintas platform via song.link)
         tidal_id, deezer_id = await downloader.resolve_with_songlink(session, url)
+
+        if not metadata and deezer_id:
+            metadata = await downloader.fetch_metadata(session, deezer_id)
+            if metadata and metadata.get("title"):
+                track_display_name = f"**{metadata.get('artist', 'Unknown')} - {metadata['title']}**"
+
         if not tidal_id:
             await status_msg.delete()
-            return await message.reply_text("❌ Gagal menemukan padanan lagu ini di database Lossless.")
+            return await message.reply_text(f"❌ Gagal menemukan padanan {track_display_name} di database Lossless.")
             
         # 3. Cek Cache
         cached_entry = audio_cache.get(tidal_id)
@@ -425,15 +461,12 @@ async def handle_url(client, message: Message):
                 logger.error(f"Gagal mengirim file fisik dari cache: {e}")
                 # Jika gagal, bisa jatuh kembali ke proses normal (download ulang)
                 
-        # 4. Ambil Metadata Deezer untuk validasi silang (jika Spotify metadata tidak ada)
-        if not metadata:
-            metadata = await downloader.fetch_metadata(session, deezer_id)
-        elif deezer_id:
-            # Ambil detail lengkap dari deezer jika kita hanya punya judul dari Spotify
+        # 4. Ambil Metadata Deezer untuk validasi silang
+        # (Deezer diakses di line 431 jika metadata belum ada. Jika masih belum ada, kita tidak perlu memanggil fetch_metadata lagi)
+        if deezer_id and metadata and "isrc" not in metadata:
+            # Jika kita punya metadata Spotify, kita tetap butuh ISRC dll dari Deezer
             deezer_meta = await downloader.fetch_metadata(session, deezer_id)
             if deezer_meta:
-                # Merge: perbarui deezer_meta dengan data dari spotify jika deezer tidak punya,
-                # tapi utamakan deezer_meta untuk isrc, cover, dll.
                 if metadata.get("title") and metadata.get("title") != "Unknown":
                     deezer_meta["title"] = metadata["title"]
                 if metadata.get("artist") and metadata.get("artist") != "Unknown":
@@ -444,20 +477,20 @@ async def handle_url(client, message: Message):
         api_data = await downloader.fetch_manifest_parallel(session, tidal_id)
         if not api_data:
             await status_msg.delete()
-            return await message.reply_text("❌ Gagal mendapatkan source audio dari semua mirror.")
+            return await message.reply_text(f"❌ Gagal mendapatkan source audio dari semua mirror untuk {track_display_name}.")
             
         # 5. Decode
         direct_url = downloader.decode_manifest(api_data)
         if not direct_url:
             await status_msg.delete()
-            return await message.reply_text("❌ Gagal mendekode link audio.")
+            return await message.reply_text(f"❌ Gagal mendekode link audio untuk {track_display_name}.")
             
         # 6. Download (Tanpa edit_text)
         filepath, meta = await downloader.download_file(session, direct_url, metadata, tidal_id)
         
         if not filepath:
             await status_msg.delete()
-            return await message.reply_text("❌ Terjadi kesalahan saat mengunduh file.")
+            return await message.reply_text(f"❌ Terjadi kesalahan saat mengunduh {track_display_name}.")
 
     # 7. Upload ke Telegram
     try:
