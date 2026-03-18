@@ -8,6 +8,7 @@ import aiohttp
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import Message
+import zipfile
 
 # Konfigurasi Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -107,6 +108,40 @@ class AsyncUniversalDownloader:
 
     def clean_filename(self, text):
         return re.sub(r'[\\/*?:"<>|]', "", text)
+
+    async def fetch_spotify_playlist_tracks(self, session, url):
+        # Gunakan endpoint embed yang biasanya mengekspos hingga 100 track
+        embed_url = url.replace("open.spotify.com/playlist/", "open.spotify.com/embed/playlist/")
+        try:
+            async with session.get(embed_url, timeout=15) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+                    if match:
+                        data = json.loads(match.group(1))
+                        entity = data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
+                        title = entity.get("name", "Spotify_Playlist")
+                        track_list = entity.get("trackList", [])
+
+                        # Ambil URL track dari daftar URI (e.g. spotify:track:...)
+                        matches = []
+                        for track in track_list:
+                            uri = track.get("uri", "")
+                            if uri.startswith("spotify:track:"):
+                                track_id = uri.split(":")[-1]
+                                matches.append(f"https://open.spotify.com/track/{track_id}")
+
+                        return title, matches
+                    else:
+                        # Fallback regex (meski kadang terbatas)
+                        matches = list(set(re.findall(r'spotify:track:([A-Za-z0-9]+)', html)))
+                        track_urls = [f"https://open.spotify.com/track/{tid}" for t_id in matches]
+                        title_match = re.search(r'<title>(.*?)</title>', html)
+                        title = title_match.group(1).split('|')[0].strip() if title_match else "Spotify_Playlist"
+                        return title, track_urls
+        except Exception as e:
+            logger.error(f"Gagal fetch playlist: {e}")
+        return None, []
 
     async def fetch_spotify_metadata(self, session, url):
         if "spotify.com" not in url:
@@ -248,6 +283,53 @@ class AsyncUniversalDownloader:
             logger.error(f"Download gagal: {e}")
             return None, None
 
+    async def process_single_track_for_playlist(self, session, track_url, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                meta = await self.fetch_spotify_metadata(session, track_url)
+                t_id, d_id = await self.resolve_with_songlink(session, track_url)
+                if not t_id:
+                    if attempt == max_retries - 1: return None, 0
+                    await asyncio.sleep(2)
+                    continue
+
+                if not meta:
+                    meta = await self.fetch_metadata(session, d_id)
+                elif d_id:
+                    d_meta = await self.fetch_metadata(session, d_id)
+                    if d_meta:
+                        if meta.get("title") and meta.get("title") != "Unknown": d_meta["title"] = meta["title"]
+                        if meta.get("artist") and meta.get("artist") != "Unknown": d_meta["artist"] = meta["artist"]
+                        meta = d_meta
+
+                api_data = await self.fetch_manifest_parallel(session, t_id)
+                if not api_data:
+                    if attempt == max_retries - 1: return None, 0
+                    await asyncio.sleep(2)
+                    continue
+
+                direct_url = self.decode_manifest(api_data)
+                if not direct_url:
+                    if attempt == max_retries - 1: return None, 0
+                    await asyncio.sleep(2)
+                    continue
+
+                filepath, _ = await self.download_file(session, direct_url, meta, t_id)
+                if filepath and os.path.exists(filepath):
+                    file_size = os.path.getsize(filepath)
+                    return filepath, file_size
+                else:
+                    if attempt == max_retries - 1: return None, 0
+                    await asyncio.sleep(2)
+                    continue
+
+            except Exception as e:
+                logger.error(f"Gagal download lagu {track_url} di playlist (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    return None, 0
+                await asyncio.sleep(2)
+        return None, 0
+
 # ================= HANDLER BOT =================
 
 @app.on_message(filters.command("start"))
@@ -267,6 +349,64 @@ async def handle_url(client, message: Message):
     downloader = AsyncUniversalDownloader()
     
     async with aiohttp.ClientSession(headers=downloader.headers) as session:
+        # Cek apakah URL adalah Playlist Spotify
+        if "/playlist/" in url:
+            playlist_title, track_urls = await downloader.fetch_spotify_playlist_tracks(session, url)
+            if not track_urls:
+                await status_msg.delete()
+                return await message.reply_text("❌ Gagal mengambil track dari playlist ini.")
+
+            await status_msg.edit_text(f"⏳ `Memproses Playlist: {playlist_title}`\n`Ditemukan {len(track_urls)} lagu. Sedang mendownload...`")
+
+            downloaded_files = []
+            total_size = 0
+            MAX_ZIP_SIZE = 1.95 * 1024 * 1024 * 1024 # 1.95 GB limit
+
+            # 1 worker process sequentially to avoid parallel ratelimits/connection issues.
+            for i, track_url in enumerate(track_urls):
+                filepath, file_size = await downloader.process_single_track_for_playlist(session, track_url)
+                if filepath:
+                    if total_size + file_size > MAX_ZIP_SIZE:
+                        os.remove(filepath)
+                        logger.info(f"Size limit reached. Removing last track to stay under 2GB.")
+                        break
+
+                    downloaded_files.append(filepath)
+                    total_size += file_size
+
+            if not downloaded_files:
+                await status_msg.delete()
+                return await message.reply_text("❌ Gagal mengunduh lagu apa pun dari playlist.")
+
+            await status_msg.edit_text("⏳ `Membuat file ZIP, mohon tunggu...`")
+
+            zip_filename = f"{downloader.clean_filename(playlist_title)}.zip"
+            zip_filepath = os.path.join(downloader.output_dir, zip_filename)
+
+            try:
+                # Compression method ZIP_STORED (or ZIP_DEFLATED)
+                with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_STORED) as zipf:
+                    for file in downloaded_files:
+                        zipf.write(file, os.path.basename(file))
+
+                await status_msg.edit_text("⏳ `Mengunggah file ZIP ke Telegram...`")
+                await message.reply_document(
+                    document=zip_filepath,
+                    caption=f"✅ **{playlist_title}**\n💿 Playlist Download ({len(downloaded_files)} lagu)"
+                )
+            except Exception as e:
+                logger.error(f"Gagal upload zip: {e}")
+                await message.reply_text(f"❌ Gagal mengirim file ZIP: {e}")
+            finally:
+                # Cleanup zip and individual files
+                if os.path.exists(zip_filepath):
+                    os.remove(zip_filepath)
+                for file in downloaded_files:
+                    if os.path.exists(file):
+                        os.remove(file)
+                await status_msg.delete()
+            return
+
         # 1. Ambil Metadata dari Spotify (jika URL Spotify)
         metadata = await downloader.fetch_spotify_metadata(session, url)
 
