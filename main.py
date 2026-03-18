@@ -108,22 +108,69 @@ class AsyncUniversalDownloader:
     def clean_filename(self, text):
         return re.sub(r'[\\/*?:"<>|]', "", text)
 
+    async def fetch_spotify_metadata(self, session, url):
+        if "spotify.com" not in url:
+            return None
+        api_url = f"https://open.spotify.com/oembed?url={url}"
+        try:
+            async with session.get(api_url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    title = data.get("title", "Unknown")
+                    artist = data.get("author_name", "Unknown")
+                    return {
+                        "title": title,
+                        "artist": artist,
+                        "album": "Unknown"
+                    }
+        except Exception as e:
+            logger.error(f"Gagal fetch spotify metadata: {e}")
+        return None
+
     async def resolve_with_songlink(self, session, input_url):
         api_url = f"https://api.song.link/v1-alpha.1/links?url={input_url}"
+        tidal_id, deezer_id = None, None
         try:
             async with session.get(api_url, timeout=15) as resp:
-                data = await resp.json()
-                entities = data.get("entitiesByUniqueId", {})
-                tidal_id, deezer_id = None, None
-                for key, entity in entities.items():
-                    if entity.get("apiProvider") == "tidal" and entity.get("type") == "song":
-                        tidal_id = entity.get("id")
-                    elif entity.get("apiProvider") == "deezer" and entity.get("type") == "song":
-                        deezer_id = entity.get("id")
-                return tidal_id, deezer_id
+                if resp.status == 200:
+                    data = await resp.json()
+                    entities = data.get("entitiesByUniqueId", {})
+                    for key, entity in entities.items():
+                        if entity.get("apiProvider") == "tidal" and entity.get("type") == "song":
+                            tidal_id = entity.get("id")
+                        elif entity.get("apiProvider") == "deezer" and entity.get("type") == "song":
+                            deezer_id = entity.get("id")
+                    return tidal_id, deezer_id
         except Exception as e:
-            logger.error(f"Gagal resolve song.link: {e}")
-            return None, None
+            logger.error(f"Gagal resolve song.link API: {e}")
+
+        # Fallback to scraping the public page if API fails or returns non-200
+        logger.info(f"Fallback to song.link web scrape for: {input_url}")
+        page_url = f"https://song.link/{input_url}"
+        try:
+            async with session.get(page_url, timeout=15) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+                    if match:
+                        data = json.loads(match.group(1))
+                        page_props = data.get('props', {}).get('pageProps', {})
+                        page_data = page_props.get('pageData', {})
+                        sections = page_data.get('sections', [])
+
+                        for section in sections:
+                            for link in section.get('links', []):
+                                platform = link.get('platform', '').lower()
+                                unique_id = link.get('uniqueId', '')
+                                if platform == 'tidal' and 'song' in unique_id:
+                                    tidal_id = re.split(r'[|:]+', unique_id)[-1]
+                                elif platform == 'deezer' and 'song' in unique_id:
+                                    deezer_id = re.split(r'[|:]+', unique_id)[-1]
+                        return tidal_id, deezer_id
+        except Exception as e:
+            logger.error(f"Gagal fallback scrape song.link: {e}")
+
+        return tidal_id, deezer_id
 
     async def fetch_metadata(self, session, deezer_id):
         if not deezer_id: return None
@@ -135,7 +182,9 @@ class AsyncUniversalDownloader:
                     return {
                         "title": data.get("title", "Unknown"),
                         "artist": data.get("artist", {}).get("name", "Unknown"),
-                        "album": data.get("album", {}).get("title", "Unknown")
+                        "album": data.get("album", {}).get("title", "Unknown"),
+                        "isrc": data.get("isrc", "Unknown"),
+                        "cover": data.get("album", {}).get("cover_xl", None)
                     }
         except Exception as e:
             logger.error(f"Gagal fetch metadata: {e}")
@@ -218,13 +267,16 @@ async def handle_url(client, message: Message):
     downloader = AsyncUniversalDownloader()
     
     async with aiohttp.ClientSession(headers=downloader.headers) as session:
-        # 1. Resolve ID
+        # 1. Ambil Metadata dari Spotify (jika URL Spotify)
+        metadata = await downloader.fetch_spotify_metadata(session, url)
+
+        # 2. Resolve ID (Cari padanan lintas platform via song.link)
         tidal_id, deezer_id = await downloader.resolve_with_songlink(session, url)
         if not tidal_id:
             await status_msg.delete()
             return await message.reply_text("❌ Gagal menemukan padanan lagu ini di database Lossless.")
             
-        # 2. Cek Cache
+        # 3. Cek Cache
         cached_entry = audio_cache.get(tidal_id)
         if cached_entry:
             cached_audio = cached_entry["filepath"]
@@ -245,10 +297,22 @@ async def handle_url(client, message: Message):
                 logger.error(f"Gagal mengirim file fisik dari cache: {e}")
                 # Jika gagal, bisa jatuh kembali ke proses normal (download ulang)
                 
-        # 3. Ambil Metadata
-        metadata = await downloader.fetch_metadata(session, deezer_id)
+        # 4. Ambil Metadata Deezer untuk validasi silang (jika Spotify metadata tidak ada)
+        if not metadata:
+            metadata = await downloader.fetch_metadata(session, deezer_id)
+        elif deezer_id:
+            # Ambil detail lengkap dari deezer jika kita hanya punya judul dari Spotify
+            deezer_meta = await downloader.fetch_metadata(session, deezer_id)
+            if deezer_meta:
+                # Merge: perbarui deezer_meta dengan data dari spotify jika deezer tidak punya,
+                # tapi utamakan deezer_meta untuk isrc, cover, dll.
+                if metadata.get("title") and metadata.get("title") != "Unknown":
+                    deezer_meta["title"] = metadata["title"]
+                if metadata.get("artist") and metadata.get("artist") != "Unknown":
+                    deezer_meta["artist"] = metadata["artist"]
+                metadata = deezer_meta
         
-        # 4. Fan-out Mirror (Paralel)
+        # 5. Fan-out Mirror (Paralel)
         api_data = await downloader.fetch_manifest_parallel(session, tidal_id)
         if not api_data:
             await status_msg.delete()
