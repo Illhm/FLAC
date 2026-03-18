@@ -293,41 +293,74 @@ async def handle_url(client, message: Message):
             downloaded_files = []
             total_size = 0
             MAX_ZIP_SIZE = 1.95 * 1024 * 1024 * 1024 # 1.95 GB limit
-            
-            for i, track_url in enumerate(track_urls):
-                try:
-                    meta = await downloader.fetch_spotify_metadata(session, track_url)
-                    t_id, d_id = await downloader.resolve_with_songlink(session, track_url)
-                    if not t_id: continue
+            size_lock = asyncio.Lock()
+            semaphore = asyncio.Semaphore(5)  # Batasi 5 concurrent downloads
+            limit_reached = False
+
+            async def process_track(track_url):
+                nonlocal total_size, limit_reached
+                retries = 3
+                for attempt in range(retries):
+                    if limit_reached:
+                        return "LIMIT_REACHED"
                     
-                    if not meta:
-                        meta = await downloader.fetch_metadata(session, d_id)
-                    elif d_id:
-                        d_meta = await downloader.fetch_metadata(session, d_id)
-                        if d_meta:
-                            if meta.get("title") and meta.get("title") != "Unknown": d_meta["title"] = meta["title"]
-                            if meta.get("artist") and meta.get("artist") != "Unknown": d_meta["artist"] = meta["artist"]
-                            meta = d_meta
+                    try:
+                        async with semaphore:
+                            if limit_reached:
+                                return "LIMIT_REACHED"
+
+                            meta = await downloader.fetch_spotify_metadata(session, track_url)
+                            t_id, d_id = await downloader.resolve_with_songlink(session, track_url)
+                            if not t_id: return None
                             
-                    api_data = await downloader.fetch_manifest_parallel(session, t_id)
-                    if not api_data: continue
-                    
-                    direct_url = downloader.decode_manifest(api_data)
-                    if not direct_url: continue
-                    
-                    filepath, _ = await downloader.download_file(session, direct_url, meta, t_id)
-                    if filepath and os.path.exists(filepath):
-                        file_size = os.path.getsize(filepath)
-                        
-                        if total_size + file_size > MAX_ZIP_SIZE:
-                            os.remove(filepath)
-                            logger.info(f"Size limit reached. Removing last track to stay under 2GB.")
-                            break
+                            if not meta:
+                                meta = await downloader.fetch_metadata(session, d_id)
+                            elif d_id:
+                                d_meta = await downloader.fetch_metadata(session, d_id)
+                                if d_meta:
+                                    if meta.get("title") and meta.get("title") != "Unknown": d_meta["title"] = meta["title"]
+                                    if meta.get("artist") and meta.get("artist") != "Unknown": d_meta["artist"] = meta["artist"]
+                                    meta = d_meta
+
+                            api_data = await downloader.fetch_manifest_parallel(session, t_id)
+                            if not api_data: return None
                             
-                        downloaded_files.append(filepath)
-                        total_size += file_size
-                except Exception as e:
-                    logger.error(f"Gagal download lagu {track_url} di playlist: {e}")
+                            direct_url = downloader.decode_manifest(api_data)
+                            if not direct_url: return None
+
+                            filepath, _ = await downloader.download_file(session, direct_url, meta, t_id)
+                            if filepath and os.path.exists(filepath):
+                                file_size = os.path.getsize(filepath)
+
+                                async with size_lock:
+                                    if limit_reached:
+                                        os.remove(filepath)
+                                        return "LIMIT_REACHED"
+
+                                    if total_size + file_size > MAX_ZIP_SIZE:
+                                        limit_reached = True
+                                        os.remove(filepath)
+                                        logger.info(f"Size limit reached. Removing last track to stay under 2GB.")
+                                        return "LIMIT_REACHED"
+
+                                    total_size += file_size
+                                    return filepath
+                    except Exception as e:
+                        logger.error(f"Gagal download lagu {track_url} (Percobaan {attempt+1}/{retries}): {e}")
+                        if attempt == retries - 1:
+                            return None
+                        await asyncio.sleep(2) # Jeda sebentar sebelum retry
+                return None
+
+            tasks = [asyncio.create_task(process_track(url)) for url in track_urls]
+            results = await asyncio.gather(*tasks)
+
+            for res in results:
+                if res == "LIMIT_REACHED":
+                    # Kalau udah limit, biarkan yg udah didownload saja
+                    pass
+                elif res is not None:
+                    downloaded_files.append(res)
             
             if not downloaded_files:
                 await status_msg.delete()
